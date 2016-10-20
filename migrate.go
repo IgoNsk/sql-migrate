@@ -275,22 +275,44 @@ func Exec(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection)
 //
 // Returns the number of applied migrations.
 func ExecMax(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, max int) (int, error) {
-	migrations, dbMap, err := PlanMigration(db, dialect, m, dir, max)
+	applied := 0
+
+	dbMap, err := getMigrationDbMap(db, dialect)
+	if err != nil {
+		return applied, err
+	}
+
+	trans, err := dbMap.Begin()
+	if err != nil {
+		return applied, err
+	}
+	isNeedRollback := true
+	defer func() {
+		if isNeedRollback {
+			trans.Rollback()
+		}
+	}()
+
+	_, err = trans.Exec(fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE", getTableName()))
+	if err != nil {
+		return applied, err
+	}
+
+	var migrationRecords []MigrationRecord
+	_, err = trans.Select(&migrationRecords, fmt.Sprintf("SELECT * FROM %s", getTableName()))
+	if err != nil {
+		return applied, err
+	}
+
+	migrations, err := planMigration(migrationRecords, m, dir, max)
 	if err != nil {
 		return 0, err
 	}
 
 	// Apply migrations
-	applied := 0
 	for _, migration := range migrations {
-		trans, err := dbMap.Begin()
-		if err != nil {
-			return applied, newTxError(migration, err)
-		}
-
 		for _, stmt := range migration.Queries {
 			if _, err := trans.Exec(stmt); err != nil {
-				trans.Rollback()
 				return applied, newTxError(migration, err)
 			}
 		}
@@ -313,12 +335,12 @@ func ExecMax(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirecti
 		} else {
 			panic("Not possible")
 		}
-
-		if err := trans.Commit(); err != nil {
-			return applied, newTxError(migration, err)
-		}
-
 		applied++
+	}
+
+	isNeedRollback = false;
+	if err := trans.Commit(); err != nil {
+		return applied, err
 	}
 
 	return applied, nil
@@ -331,15 +353,21 @@ func PlanMigration(db *sql.DB, dialect string, m MigrationSource, dir MigrationD
 		return nil, nil, err
 	}
 
-	migrations, err := m.FindMigrations()
-	if err != nil {
-		return nil, nil, err
-	}
-
 	var migrationRecords []MigrationRecord
 	_, err = dbMap.Select(&migrationRecords, fmt.Sprintf("SELECT * FROM %s", getTableName()))
 	if err != nil {
 		return nil, nil, err
+	}
+
+	migrations, err := planMigration(migrationRecords, m, dir, max)
+	return migrations, dbMap, err
+}
+
+// Internal
+func planMigration(migrationRecords []MigrationRecord, m MigrationSource, dir MigrationDirection, max int) ([]*PlannedMigration, error) {
+	migrations, err := m.FindMigrations()
+	if err != nil {
+		return nil, err
 	}
 
 	// Sort migrations that have been run by Id.
@@ -386,7 +414,7 @@ func PlanMigration(db *sql.DB, dialect string, m MigrationSource, dir MigrationD
 		}
 	}
 
-	return result, dbMap, nil
+	return result, nil
 }
 
 // Filter a slice of migrations into ones that should be applied.
